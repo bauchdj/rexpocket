@@ -7,8 +7,11 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okhttp3.OkHttpClient
@@ -30,15 +33,30 @@ import java.util.Base64
  * control connection for the one-time ticket a new stream needs.
  */
 class TerminalStream(
-    private val endpoint: Endpoint,
+    /** The address each attempt dials: a host's address in use can change between attempts. */
+    private val endpointOf: () -> Endpoint,
     private val httpFactory: () -> OkHttpClient,
     /** Diagnostics: each connection, how its handshake went and why it ended. */
     private val trace: (String) -> Unit = {},
+    /**
+     * Whether the app is on screen; null when the stream does not care. Away for [awayGraceMs],
+     * the stream is let go until the app is back (see [feeds]).
+     */
+    private val visible: StateFlow<Boolean>? = null,
+    private val awayGraceMs: Long = AWAY_GRACE_MS,
+    /** How long a dropped stream can be resumed; null for what Rex's WELCOME says, less a margin. See [feeds]. */
+    private val resumeWindowMs: Long? = null,
     private val ticket: suspend () -> String,
 ) {
+    constructor(endpoint: Endpoint, httpFactory: () -> OkHttpClient, trace: (String) -> Unit = {}, ticket: suspend () -> String) :
+        this({ endpoint }, httpFactory, trace, ticket = ticket)
+
     /** Stream bytes handed over so far: what a RESUME tells Rex it does not need again. */
     @Volatile private var received = 0L
     @Volatile private var resumeToken: ByteString? = null
+
+    /** How long Rex said it keeps this stream for a resume, in ms; 0 when it did not say. */
+    @Volatile private var rexKeepsMs = 0L
     @Volatile private var active: WebSocket? = null
     @Volatile private var stopped = false
 
@@ -67,10 +85,27 @@ class TerminalStream(
     /**
      * The pane's bytes in order, for as long as this flow is collected. Decoding runs off the main
      * thread: a snapshot can be megabytes, and its pieces arrive in whatever size the network made.
+     *
+     * With the app away from the screen for [awayGraceMs], the stream is dropped - without a close,
+     * so Rex keeps it - and nothing is read until the app is back: a busy pane no one looks at costs
+     * no data, radio or emulator time, while its notifications still come on the control
+     * connection. Back within the time Rex's WELCOME said it keeps a stream (a minute), the stream
+     * resumes where it stopped, cheaply; later than that Rex has let it go, so the stream starts over with a ticket and a snapshot at once,
+     * rather than first being refused a RESUME.
      */
     fun feeds(): Flow<TerminalFeed> = flow {
         var attempt = 0
+        // When the stream was let go for the app being away; 0 while it is not.
+        var parkedAt = 0L
         while (!stopped) {
+            if (parkedAt != 0L) {
+                visible?.first { it }
+                val away = elapsed(parkedAt)
+                val window = resumeWindowMs ?: if (rexKeepsMs > 0) rexKeepsMs - RESUME_MARGIN_MS else RESUME_WINDOW_MS
+                if (away >= window) resumeToken = null
+                trace("stream back after ${away}ms let go while away: " + if (resumeToken != null) "resuming" else "starting over")
+                parkedAt = 0L
+            }
             val openedAt = System.nanoTime()
             // Anything left from an earlier wake belongs to an attempt that has ended.
             wake.tryReceive()
@@ -89,6 +124,9 @@ class TerminalStream(
                 continue
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: PaneClosedException) {
+                // There is nothing left to open: the pane is gone.
+                throw e
             } catch (e: Exception) {
                 trace("stream open failed after ${elapsed(openedAt)}ms: ${e.javaClass.simpleName}: ${e.message}")
                 if (++attempt > MAX_ATTEMPTS) throw e
@@ -98,18 +136,42 @@ class TerminalStream(
             attempt = 0
             trace("stream open after ${elapsed(openedAt)}ms (resumed at $received)")
             val decoder = StreamDecoder(socket.nonce)
+            var letGo = 0L
             try {
-                for (frame in socket.frames) {
-                    when (frame) {
-                        is Frame.Bytes -> {
-                            // A stream that carries bytes is a stream that worked: what failed
-                            // before it must not count against how often this one may start over.
-                            attempt = 0
-                            received += frame.bytes.size
-                            for (feed in decoder.feed(frame.bytes)) emit(feed)
+                try {
+                    coroutineScope {
+                        // Away long enough: drop the socket, as a network that went would, so Rex
+                        // holds the stream for a resume.
+                        val parker = visible?.let { v ->
+                            launch {
+                                awayFor(v, awayGraceMs)
+                                letGo = System.nanoTime()
+                                trace("stream let go at $received bytes: away ${awayGraceMs}ms")
+                                socket.webSocket.cancel()
+                            }
                         }
-                        is Frame.Closed -> throw frame.cause ?: DroppedStream("The terminal stream ended")
+                        try {
+                            for (frame in socket.frames) {
+                                when (frame) {
+                                    is Frame.Bytes -> {
+                                        // A stream that carries bytes is a stream that worked: what failed
+                                        // before it must not count against how often this one may start over.
+                                        attempt = 0
+                                        received += frame.bytes.size
+                                        for (feed in decoder.feed(frame.bytes)) emit(feed)
+                                    }
+                                    is Frame.Closed -> throw frame.cause ?: DroppedStream("The terminal stream ended")
+                                }
+                            }
+                        } finally {
+                            parker?.cancel()
+                        }
                     }
+                } catch (e: Exception) {
+                    if (e is CancellationException || letGo == 0L || stopped) throw e
+                    // Let go on purpose: the top of the loop waits for the app, then resumes.
+                    parkedAt = letGo
+                    continue
                 }
                 return@flow
             } catch (e: CancellationException) {
@@ -127,6 +189,8 @@ class TerminalStream(
                 // A drop asked for by reconnectNow is retried at once: its wake is still pending.
                 pause(backoff(attempt))
             } finally {
+                // Nothing reads its frames any more: a reader thread waiting to hand one over lets go.
+                socket.frames.cancel()
                 // A deliberate stop ends the stream; a drop keeps it waiting for a resume.
                 if (stopped) socket.webSocket.close(CLOSE_NORMAL, "bye") else socket.webSocket.cancel()
                 active = null
@@ -139,6 +203,14 @@ class TerminalStream(
         active?.close(CLOSE_NORMAL, "bye")
     }
 
+    /** Returns once the app has been away from the screen for [ms] without coming back. */
+    private suspend fun awayFor(visible: StateFlow<Boolean>, ms: Long) {
+        while (true) {
+            visible.first { !it }
+            withTimeoutOrNull(ms) { visible.first { it } } ?: return
+        }
+    }
+
     /** Waits [ms] between attempts, or until [retryNow]. */
     private suspend fun pause(ms: Long) {
         withTimeoutOrNull(ms) { wake.receive() }
@@ -147,25 +219,41 @@ class TerminalStream(
     /** An attempt given up for a fresh one, not a failure of the stream. */
     private class Retried : CancellationException("retrying now")
 
-    /** Opens one connection and waits for its WELCOME. */
-    private suspend fun open(): Connected {
-        val hello = handshake()
+    /**
+     * Opens one connection and waits for its WELCOME. A new stream's ticket is asked for while the
+     * socket opens, not before: the HELLO that carries it goes once both are there, which saves a
+     * round trip each time a pane is opened.
+     */
+    private suspend fun open(): Connected = coroutineScope {
+        val resuming = resumeToken != null && received > 0
+        val hello = async { handshake() }
+        val opened = CompletableDeferred<WebSocket>()
         val welcome = CompletableDeferred<Connected>()
         // Each connection gets its own: a socket that failed still reports its close afterwards,
         // and the next connection must not take that close for its own.
-        val frames = Channel<Frame>(Channel.UNLIMITED)
+        // Bounded: when the screen falls behind, OkHttp's reader waits on it (see [deliver]), and
+        // TCP tells Rex to slow down, rather than the phone's heap taking all of a `cat` at once.
+        val frames = Channel<Frame>(FRAMES_BUFFERED)
         val request = Request.Builder()
-            .url(endpoint.ws("/api/data"))
+            .url(endpointOf().ws("/api/data"))
             .header("Sec-WebSocket-Protocol", PROTOCOL)
             .build()
-        val ws = httpFactory().newWebSocket(request, listener(hello, welcome, frames))
+        val ws = httpFactory().newWebSocket(request, listener(opened, welcome, frames))
         active = ws
         try {
-            return welcome.await()
+            val handshake = hello.await()
+            opened.await().send(ByteString.of(*handshake))
+            welcome.await().also {
+                // A HELLO starts a new stream, and a RESUME counts that stream's bytes alone: counted
+                // on from the old one, Rex refused every later resume and the pane was drawn again.
+                if (!resuming) received = 0
+            }
         } catch (e: CancellationException) {
+            frames.cancel()
             ws.cancel()
             throw e
         } catch (e: Exception) {
+            frames.cancel()
             ws.cancel()
             // Only a refusal that names the token or the stream means it is gone; anything else,
             // and Rex still holds the stream for a resume.
@@ -175,12 +263,12 @@ class TerminalStream(
     }
 
     private fun listener(
-        hello: ByteArray,
+        opened: CompletableDeferred<WebSocket>,
         welcome: CompletableDeferred<Connected>,
         frames: Channel<Frame>,
     ) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            webSocket.send(ByteString.of(*hello))
+            opened.complete(webSocket)
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -188,6 +276,7 @@ class TerminalStream(
                 when (val answer = parseWelcome(bytes.toByteArray())) {
                     is Welcome.Ok -> {
                         resumeToken = answer.token
+                        rexKeepsMs = answer.keepMs
                         welcome.complete(Connected(webSocket, answer.nonce, frames))
                     }
                     is Welcome.Rejected -> welcome.completeExceptionally(
@@ -201,7 +290,7 @@ class TerminalStream(
                 }
                 return
             }
-            frames.trySend(Frame.Bytes(bytes.toByteArray()))
+            deliver(frames, Frame.Bytes(bytes.toByteArray()))
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -210,13 +299,31 @@ class TerminalStream(
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             val dropped = DroppedStream(describe(code, reason), fatal = code == CLOSE_BLOCK_CLOSED)
+            // Rex could not keep the stream: a RESUME would only be refused, so the next attempt says HELLO.
+            if (code == CLOSE_RECONNECT_REQUIRED && welcome.isCompleted) resumeToken = null
+            opened.completeExceptionally(dropped)
             if (!welcome.isCompleted) welcome.completeExceptionally(dropped)
-            frames.trySend(Frame.Closed(dropped))
+            deliver(frames, Frame.Closed(dropped))
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            opened.completeExceptionally(t)
             if (!welcome.isCompleted) welcome.completeExceptionally(t)
-            frames.trySend(Frame.Closed(t))
+            deliver(frames, Frame.Closed(t))
+        }
+    }
+
+    /**
+     * Hands [frame] to the reader, waiting for room when it is behind: this runs on OkHttp's own
+     * reader thread for the socket, so waiting there stops reading it and lets TCP push back on
+     * Rex. A reader that is gone has cancelled [frames], and the frame is dropped with it.
+     */
+    private fun deliver(frames: Channel<Frame>, frame: Frame) {
+        if (frames.trySend(frame).isSuccess) return
+        try {
+            runBlocking { frames.send(frame) }
+        } catch (_: Exception) {
+            // Cancelled or closed: nobody reads this connection any more.
         }
     }
 
@@ -236,7 +343,10 @@ class TerminalStream(
                 // is the least significant, so Rex's own messages carry it in decimal.
                 var nonce = 0uL
                 for (i in 0 until 8) nonce = nonce or (bytes[WELCOME_BYTES - 8 + i].toUByte().toULong() shl (8 * i))
-                Welcome.Ok(bytes.copyOfRange(1, 1 + TOKEN_BYTES).toByteString(), nonce)
+                // Before it, after three zero bytes, how long Rex keeps the stream for a resume.
+                var keep = 0L
+                for (i in 0 until 4) keep = keep or ((bytes[WELCOME_BYTES - 12 + i].toLong() and 0xff) shl (8 * i))
+                Welcome.Ok(bytes.copyOfRange(1, 1 + TOKEN_BYTES).toByteString(), nonce, keep)
             }
         OP_REJECT.toByte() -> Welcome.Rejected(bytes.getOrElse(1) { REJECT_UNKNOWN })
         else -> Welcome.Rejected(REJECT_UNKNOWN)
@@ -258,7 +368,7 @@ class TerminalStream(
     }
 
     private sealed interface Welcome {
-        class Ok(val token: ByteString, val nonce: ULong) : Welcome
+        class Ok(val token: ByteString, val nonce: ULong, val keepMs: Long) : Welcome
         class Rejected(val reason: Byte) : Welcome
     }
 
@@ -279,6 +389,8 @@ class TerminalStream(
         /** Rex closes with 4000 when the block is gone; no reconnect helps there. */
         private const val CLOSE_BLOCK_CLOSED = 4000
         private const val CLOSE_NORMAL = 1000
+        /** `data reconnect required`: the stream is gone, and only a new ticket and a HELLO start it again. */
+        private const val CLOSE_RECONNECT_REQUIRED = 1013
 
         private const val REJECT_UNKNOWN = 0x00.toByte()
         /** Another connection to the same pane exists, which a RESUME replaces. */
@@ -288,6 +400,21 @@ class TerminalStream(
         private const val REJECT_CLOSED = 0x03.toByte()
 
         private const val MAX_ATTEMPTS = 5
+
+        /** How long away from the screen before a stream is let go: a trip to another app keeps it. */
+        const val AWAY_GRACE_MS = 60_000L
+
+        /**
+         * How long a dropped stream is resumed when Rex did not say how long it keeps one: its
+         * minute (Rex 0.1.0-preview.22), less [RESUME_MARGIN_MS].
+         */
+        const val RESUME_WINDOW_MS = 55_000L
+
+        /** Taken off the time Rex keeps a stream, so a RESUME is not sent just as Rex lets it go. */
+        const val RESUME_MARGIN_MS = 5_000L
+
+        /** Messages held for the reader before the socket waits; Rex sends pieces of a few KB to 64 KB. */
+        private const val FRAMES_BUFFERED = 256
 
         private fun backoff(attempt: Int): Long = (300L * attempt).coerceAtMost(2_000L)
 

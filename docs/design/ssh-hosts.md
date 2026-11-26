@@ -48,6 +48,13 @@ ssh://my-mac.tail1234.ts.net # tailnet 地址
 
 界面会在保存前检查账号和凭据是否齐全。密码和私钥不会同时保存：切换登录方式后，另一种凭据在保存时清空。
 
+选择 Private key 时还有两个按钮（`SshKeyActions`，`HostDialogParts.kt`）：
+
+- **Generate key**：用 `SshKeys.generate` 在手机上生成新的 Ed25519 密钥（注释 `rexpocket:<主机名>`），填入私钥字段并显示公钥。已有私钥时先确认再替换；保存前不写入任何东西。
+- **Show public key**：显示当前私钥的公钥（`SshKeys.publicKeyOf`，经 JSch 读取 OpenSSH、PEM 等格式；加密的私钥需要填好 passphrase）。
+
+公钥以 Import hosts 相同的格式显示：一行 `# 主机名`，下一行公钥，可直接追加到 `authorized_keys`；有 Copy 和 Share。私钥从不显示、复制或分享。测试：`SshKeysTest`（core）、`OtherAddressesTest.generateKeyShowsThePublicHalfInTheImportForm`（app）。
+
 ### 2.3 主机密钥
 
 第一次连接时，App 显示机器 SSH 主机密钥的 SHA-256 指纹（OpenSSH 的 `SHA256:...` 格式），由用户和电脑上的密钥核对后确认。确认后指纹按主机保存。
@@ -59,6 +66,10 @@ ssh://my-mac.tail1234.ts.net # tailnet 地址
 
 App 不会自动接受未知主机密钥，也不会静默接受变化后的密钥。
 
+主机的其他地址（fallbacks，见 [multi-host.md](multi-host.md) 的 "Other addresses"）共用这一个指纹：每个 SSH 地址都必须出示同一把主机密钥，不同的密钥按"已变化"处理并停止，不会按地址分别信任。
+
+也可以一次导入多台主机，并预先固定各自的主机密钥（第一次连接即被校验，不再询问），格式与信任规则见 [host-import.md](host-import.md)。
+
 ### 2.4 凭据存储
 
 密码、私钥和 passphrase 使用 Android Keystore 中的 AES-256-GCM 密钥加密，再写入 App 的 SharedPreferences。存储格式带 `v1:` 前缀，内容为 `IV + ciphertext` 的 Base64。
@@ -67,7 +78,10 @@ App 不会自动接受未知主机密钥，也不会静默接受变化后的密�
 
 - SharedPreferences 或 Android 备份中只有密文；
 - Keystore 密钥不会随备份迁移；换机恢复后密文无法解开，App 将其视为“尚未填写凭据”，要求重新输入；
-- 解密失败不会被当作空密码继续连接，而是让用户重新填写。
+- 解密失败不会被当作空密码继续连接：连接停下并说明是本机 Keystore 打不开已保存的密码或密钥（`Trouble.SshSecretUnreadable`），下一次连接会再向 Keystore 要一次密钥（`SecretBox` 不会把一次失败记到进程结束）；
+- 打不开的密文原样保留：`HostStore` 写回主机列表时，没有改动的密码、私钥、passphrase 一律写回读到的那段密文，不重新加密，所以 Keystore 一时失败、之后保存任何主机（改名、信任主机密钥、导入）都不会用空值覆盖已保存的凭据。只有用户真的改了（或清空了已解开的）凭据才重新加密；
+- 主机列表（`HostStore.list()`、`find()`、每次保存）不碰 Keystore：凭据保持密文（`SavedHost.stored`），只在需要时打开一台主机的（`HostStore.withSecrets`）——连接时在 IO 线程上、Test connection 和主机对话框打开时、导入和备份时。主页和每次保存因此没有主线程上的 Keystore 调用；
+- 主机列表的读-改-写（`upsert`、`saveAll`、`delete`）在进程内串行，两处同时保存（例如两个线程各自保存一台主机）不会丢掉其中一台。
 
 ## 3. 连接模型
 

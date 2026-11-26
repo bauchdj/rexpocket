@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Connecting hosts and tailnets, one model for both: their state, their page, their tile and their
+     notification lines. See docs/design/tailnet-control.md. -->
+<resources>
+    <!-- The state words every screen, tile and notification shares. -->
+    <string name="conn_state_off">Off</string>
+    <string name="conn_state_connecting">Connecting…</string>
+    <string name="conn_state_connected">Connected</string>
+    <string name="conn_state_sign_in">Needs sign-in</string>
+    <string name="conn_state_failed">Not connected</string>
+
+    <!-- A tailnet that is joined and not running. -->
+    <string name="tailnet_stage_disconnected">%1$s is disconnected</string>
+    <string name="tailnet_stage_standby">%1$s starts when a host connects</string>
+    <plurals name="tailnet_used_by">
+        <item quantity="one">Used by %1$d host</item>
+        <item quantity="other">Used by %1$d hosts</item>
+    </plurals>
+    <plurals name="tailnet_stops_in">
+        <item quantity="one">No host uses it · stops in %1$d minute</item>
+        <item quantity="other">No host uses it · stops in %1$d minutes</item>
+    </plurals>
+
+    <!-- Disconnecting a tailnet that hosts are connected through. -->
+    <string name="tailnet_disconnect_title">Disconnect %1$s?</string>
+    <plurals name="tailnet_disconnect_body">
+        <item quantity="one">%2$s is connected through it and disconnects too. It stays off until you connect it, or a host on it.</item>
+        <item quantity="other">%2$s are connected through it and disconnect too. It stays off until you connect it, or a host on it.</item>
+    </plurals>
+    <string name="tailnet_connect_item">Connect %1$s</string>
+    <string name="tailnet_restart_item">Restart</string>
+    <string name="tailnet_disconnect_item">Disconnect %1$s</string>
+
+    <!-- A host's or a tailnet's page: the same groups in the same order. -->
+    <string name="conn_group_open">While RexPocket is open</string>
+    <string name="conn_group_background">In the background</string>
+    <string name="conn_group_notifications">Notifications</string>
+    <string name="conn_group_tile">Quick Settings</string>
+    <string name="conn_settings">Connection and notifications</string>
+    <string name="bg_group_tailnets">Tailnets</string>
+
+    <string name="tailnet_use">Keep connected</string>
+    <string name="tailnet_use_open">While the app is open</string>
+    <string name="tailnet_use_open_body">Up whenever RexPocket is open, so a host on it connects at once.</string>
+    <string name="tailnet_use_needed">Only when a host needs it</string>
+    <string name="tailnet_use_needed_body">Starts when a host on it connects, and stops a while after the last one goes. Saves battery; the first connect waits for the tailnet.</string>
+    <string name="tailnet_linger">Stop after</string>
+    <string name="tailnet_linger_body">Once no host uses it</string>
+    <string name="tailnet_linger_choice_body">How long it stays up with no host on it, open or in the background.</string>
+    <string name="linger_1">1 minute</string>
+    <string name="linger_5">5 minutes</string>
+    <string name="linger_15">15 minutes</string>
+    <string name="linger_never">Never</string>
+
+    <string name="bg_keep">While you are away</string>
+    <string name="bg_keep_host_follow">Stay connected</string>
+    <string name="bg_keep_host_follow_body">Stays connected in the background if it was connected when you left.</string>
+    <string name="bg_keep_host_off">Let go</string>
+    <string name="bg_keep_tailnet_follow">With its hosts</string>
+    <string name="bg_keep_tailnet_follow_body">Stays up while a host on it stays connected in the background, and stops once none does (after the time above).</string>
+    <string name="bg_keep_tailnet_always">Always</string>
+    <string name="bg_keep_tailnet_always_body">Stays up while background mode is on, even with no host connected, so hosts connect at once when you open RexPocket. Uses more battery.</string>
+    <string name="bg_keep_tailnet_off">Let go</string>
+    <string name="bg_keep_tailnet_off_body">Stops a minute after you leave RexPocket, and its hosts with it; starts again when you come back.</string>
+    <string name="bg_keep_mode_off">Background mode is off, so everything stops when RexPocket closes.</string>
+
+    <string name="tailnet_notify">Sign-in and failures</string>
+    <string name="tailnet_notify_body">While you are away, says when it needs a sign-in or stops working.</string>
+
+    <!-- The watch notification. -->
+    <string name="bg_watch_tailnet_title">%1$s connected</string>
+    <string name="bg_watch_tailnet_body">No host connected · it stays up for a quick connect</string>
+    <string name="bg_watch_line">%1$s · %2$s</string>
+    <string name="tailnet_alert_sign_in">%1$s needs a sign-in</string>
+    <string name="tailnet_alert_sign_in_body">Hosts on it cannot be reached until you sign in. Tap to open RexPocket.</string>
+    <string name="tailnet_alert_failed">%1$s stopped working</string>
+    <string name="tailnet_alert_failed_body">Hosts on it cannot be reached. Tap to open RexPocket and try again.</string>
+
+    <!-- Quick Settings tiles. -->
+    <string name="tile_label">RexPocket</string>
+    <string name="tile_pick">Tap to choose</string>
+    <string name="tile_gone">Removed · tap to choose</string>
+    <string name="tile_add">Add a tile</string>
+    <string name="tile_add_body">Connect and disconnect from Quick Settings. Long-press the tile to come back here.</string>
+    <string name="tile_added">On tile %1$d</string>
+    <string name="tile_add_manual">Edit Quick Settings and drag the RexPocket %1$d tile in.</string>
+    <string name="tile_slots_full">All three tiles are in use. Replace one below, or change one in Settings › Background and notifications.</string>
+    <string name="tile_slot_label">RexPocket %1$d</string>
+
+    <!-- Accounts: several sign-ins to one tailnet, one running at a time. -->
+    <string name="tailnet_group_accounts">Accounts</string>
+    <string name="tailnet_account_in_use">In use</string>
+    <string name="tailnet_account_add">Add an account</string>
+    <string name="tailnet_account_add_action">Add and switch</string>
+    <string name="tailnet_account_add_body">Another sign-in or tailnet. One account runs at a time; switching reconnects the hosts through it.</string>
+    <string name="tailnet_account_sign_in_note">%1$s starts again on the new account and asks you to sign in.</string>
+    <string name="tailnet_account_key_note">%1$s starts again on the new account; join it with its key in Tailnet settings.</string>
+    <string name="tailnet_account_name">Name</string>
+    <string name="tailnet_account_use">Use this account</string>
+    <string name="tailnet_account_switch_body">The tailnet starts again on this account.</string>
+    <plurals name="tailnet_account_switch_hosts">
+        <item quantity="one">The tailnet starts again on this account. %2$s disconnects, and comes back on it unless it is on another account.</item>
+        <item quantity="other">The tailnet starts again on this account. %2$s disconnect, and come back on it unless they are on another account.</item>
+    </plurals>
+    <string name="tailnet_account_remove">Remove</string>
+    <string name="tailnet_account_remove_title">Remove %1$s?</string>
+    <string name="tailnet_account_remove_body">Its sign-in on this phone is deleted.</string>
+    <plurals name="tailnet_account_remove_hosts">
+        <item quantity="one">%2$s is on it, and follows the account in use from then on.</item>
+        <item quantity="other">%2$s are on it, and follow the account in use from then on.</item>
+    </plurals>
+    <string name="tailnet_account_label">Tailnet account</string>
+    <string name="tailnet_account_follow">The one in use</string>
+    <string name="tile_change">Change…</string>
+    <string name="tile_remove">Remove from tile</string>
+    <string name="tile_replace">Replace tile %1$d (%2$s)</string>
+    <string name="tile_item_gone">removed</string>
+    <string name="tile_free">free</string>
+    <string name="tile_slot_item">Tile %1$d · %2$s</string>
+    <string name="tile_clear">Clear tile</string>
+    <string name="tile_clear_n">Clear tile %1$d</string>
+    <string name="tile_group_all">Quick Settings tiles</string>
+    <string name="tile_picker_title_slot">What should tile %1$d connect?</string>
+    <string name="tile_picker_tiles">Tile</string>
+    <string name="tile_picker_items">Connects</string>
+    <string name="tile_on_this">On this tile</string>
+    <string name="tile_moves_from">Moves here from tile %1$d</string>
+    <string name="bg_turn_on">Turn on background mode</string>
+    <string name="bg_turn_on_short">Turn on</string>
+    <string name="bg_watch_only_with_mode">The background notification, with its Stop, Connect and Disconnect buttons, shows only while background mode is on.</string>
+    <string name="bg_watch_check">Background notification</string>
+    <string name="bg_watch_check_off">Background mode is off, so there is no notification and no buttons in the shade. A tile still connects while RexPocket is open.</string>
+    <string name="bg_watch_check_hidden">Background mode is running, but Android hides its notification and its buttons.</string>
+    <string name="bg_watch_check_shown">Shown while background mode runs, with Stop and a button per host or tailnet.</string>
+</resources>

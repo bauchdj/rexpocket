@@ -31,7 +31,9 @@ android {
         versionName = "0.1.3"
 
         // The tailnet and Ghostty libraries are built for arm64 only, so the APK must not claim the other ABIs either.
-        ndk.abiFilters += "arm64-v8a"
+        // The device tests on an x86_64 emulator build both libraries for x86_64 and pass
+        // -Prexpocket.abi=x86_64 (see .github/workflows/device-test.yml); nothing else sets it.
+        ndk.abiFilters += (findProperty("rexpocket.abi") as String?) ?: "arm64-v8a"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -45,11 +47,51 @@ android {
         }
     }
 
+    // CI's phone builds: -Prexpocket.debugKeystore names a debug key kept between runs, so each debug
+    // and optimized APK installs over the last. Without it they sign with this computer's own debug key.
+    (findProperty("rexpocket.debugKeystore") as String?)?.let { path ->
+        signingConfigs.create("ciDebug") {
+            storeFile = file(path)
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+        buildTypes.getByName("debug").signingConfig = signingConfigs.getByName("ciDebug")
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 in full mode (AGP's default), with the rules in proguard-rules.pro: what JSch,
+            // libghostty's JNI_OnLoad and the tailnet library find by name. See docs/design/r8.md.
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.getByName("release")
         }
+        // The release build signed with the debug key instead of the release one: what CI's phone
+        // builds publish as rexpocket.apk (android-apk.yml). Minified, not debuggable, with the
+        // baseline profile, so it runs as a release does; signed like the debug build (with
+        // -Prexpocket.debugKeystore, CI's kept key), so it installs over a debug install as an update.
+        create("optimized") {
+            initWith(getByName("release"))
+            signingConfig = signingConfigs.findByName("ciDebug") ?: signingConfigs.getByName("debug")
+            matchingFallbacks += "release"
+        }
+        // The optimized build with every class the instrumented tests call kept (renamed still):
+        // device-test.yml runs a set of the tests against it to catch a missing keep rule. Only
+        // what -Prexpocket.testBuildType=minified asks for; see docs/design/r8.md.
+        create("minified") {
+            initWith(getByName("optimized"))
+            proguardFile("proguard-test-keep.pro")
+            testProguardFiles("proguard-test.pro")
+        }
+    }
+    (findProperty("rexpocket.testBuildType") as String?)?.let { testBuildType = it }
+
+    // The app is translated into English, Simplified and Traditional Chinese only; the other
+    // languages AndroidX ships would only label its own few strings in a language the app is not in.
+    androidResources {
+        localeFilters += listOf("en", "zh", "zh-rTW")
     }
 
     buildFeatures {
@@ -66,6 +108,18 @@ android {
         // The unit tests run the real libghostty-vt on this computer; the Android classes the
         // session touches (a Handler for its debounce) only need to exist.
         unitTests.isReturnDefaultValues = true
+        // The Compose screen tests on the JVM (Robolectric, Roborazzi) read the app's resources.
+        // See docs/design/testing.md.
+        unitTests.isIncludeAndroidResources = true
+    }
+
+    // The screen tests in src/sharedTest run twice from one source: on the JVM (Robolectric) with
+    // the unit tests, quick to run on any computer, and on the emulator with the instrumented ones.
+    sourceSets {
+        getByName("test").java.srcDir("src/sharedTest/java")
+        getByName("androidTest").java.srcDir("src/sharedTest/java")
+        // The test host activity the Compose tests need, for the tests run against the minified build.
+        getByName("minified").manifest.srcFile("src/debug/AndroidManifest.xml")
     }
 
     packaging {
@@ -117,6 +171,25 @@ tasks.withType<Test>().configureEach {
     systemProperty("java.library.path", hostLibraryDir.absolutePath)
 }
 
+// Robolectric's Android for the JVM screen tests comes through Gradle's own repositories, cached
+// like any other dependency, instead of Robolectric fetching it from Maven Central as the tests
+// run. One Android version: the one the tests' @Config names. See docs/design/testing.md.
+val robolectricAndroid: Configuration by configurations.creating { isTransitive = false }
+val robolectricJars by tasks.registering(Sync::class) {
+    from(robolectricAndroid)
+    into(layout.buildDirectory.dir("robolectric"))
+}
+tasks.withType<Test>().configureEach {
+    dependsOn(robolectricJars)
+    systemProperty("robolectric.offline", "true")
+    systemProperty("robolectric.dependency.dir", layout.buildDirectory.dir("robolectric").get().asFile.absolutePath)
+    // Roborazzi writes each screenshot the tests take to build/outputs/roborazzi, for review.
+    systemProperty("roborazzi.test.record", "true")
+    // Real rendering, so screenshots show the screen and layout is measured as on a phone.
+    systemProperty("robolectric.graphicsMode", "NATIVE")
+    systemProperty("robolectric.pixelCopyRenderMode", "hardware")
+}
+
 // A release build is only made with the release key: with no key set it stops before anything is
 // signed, instead of producing an APK that cannot update the installed app.
 gradle.taskGraph.whenReady {
@@ -127,23 +200,77 @@ gradle.taskGraph.whenReady {
     }
 }
 
+// Which tailnet library to link: the Tailscale-only one unless Netbird is asked for.
+val withNetbird = (findProperty("rexpocket.netbird") as String?).toBoolean()
+val tailnetLibrary = rootProject.file(if (withNetbird) "app/libs/tailnet-netbird.aar" else "app/libs/tailnet.aar")
+require(tailnetLibrary.isFile) { "${tailnetLibrary.name} is missing: build it with tools/build-tailnet.sh" }
+
+// The Netbird add-on (:netbirdaddon, a separate app) is offered by the default build only; the build
+// with Netbird embedded has no use for it. Its client lives in src/addon, with its unit and device
+// tests in src/testAddon and src/androidTestAddon; src/embedded is what the embedded build has in
+// its place. See docs/design/tailnet-backends.md.
+val withAddon = !withNetbird
+android.sourceSets {
+    getByName("main").java.srcDir(if (withAddon) "src/addon/java" else "src/embedded/java")
+    if (withAddon) {
+        getByName("test").java.srcDir("src/testAddon/java")
+        getByName("androidTest").java.srcDir("src/androidTestAddon/java")
+    }
+}
+
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // Screens driven and captured on the JVM: see docs/design/testing.md.
+    testImplementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    testImplementation("androidx.test:core:1.7.0")
+    testImplementation("androidx.test.ext:junit:1.3.0")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    robolectricAndroid("org.robolectric:android-all-instrumented:15-robolectric-12650502-i7")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.40.1")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.40.1")
     androidTestImplementation("androidx.test:core:1.7.0")
     androidTestImplementation("androidx.test:runner:1.7.0")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
-    implementation(project(":core"))
+    // The terminal screen's own controls, driven on a device: see FullScreenTest.
+    androidTestImplementation(platform("androidx.compose:compose-bom:2024.12.01"))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+    // The fake Rex the scenarios in core run on, for the screen tests that connect: see LaunchTest.
+    testImplementation(testFixtures(project(":core")))
+    androidTestImplementation(testFixtures(project(":core")))
+    // The empty activity the Compose test rule hosts its content in is declared in
+    // src/debug/AndroidManifest.xml, not by ui-test-manifest: that one is exported, and the debug
+    // APK is the one people install.
+    // :core is a JVM module and brings org.json:json for its own tests and JVM use. Android has
+    // org.json built in, and that copy is the one that runs: packing the Maven one as well let R8
+    // optimize against it (its JSONException is a RuntimeException, Android's is not), and the
+    // optimized APK failed verification at launch. Only the JVM unit tests take the Maven copy.
+    implementation(project(":core")) { exclude(group = "org.json", module = "json") }
+    testImplementation("org.json:json:20240303")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     // What the window is wide enough for: one column, or a list beside its pane.
     implementation("androidx.compose.material3.adaptive:adaptive")
     implementation("androidx.activity:activity-compose:1.9.3")
+    // The home screen widget: what needs the person, what is done and what works, per host.
+    implementation("androidx.glance:glance-appwidget:1.1.1")
+    // ExploreByTouchHelper: the terminal's lines as virtual views for TalkBack.
+    implementation("androidx.customview:customview:1.1.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // The official tailscale.com tsnet library behind the tailnet/ Go module, see tools/build-tailnet.sh.
-    implementation(files("libs/tailnet.aar"))
+    // The tailnet library behind the tailnet/ Go module, see tools/build-tailnet.sh: the official
+    // tailscale.com tsnet library, and Netbird's embedded client when it is built in. Netbird adds
+    // about 30 MB to the APK, so it is a build choice: -Prexpocket.netbird=true links the library built
+    // with REXPOCKET_NETBIRD=1 instead.
+    implementation(files(tailnetLibrary))
+    if (withAddon) implementation(project(":netbirdaddon-api"))
+}
+
+// The instrumented tests run on Android's org.json too (see the :core dependency above).
+configurations.configureEach {
+    if (name.contains("AndroidTest")) exclude(group = "org.json", module = "json")
 }

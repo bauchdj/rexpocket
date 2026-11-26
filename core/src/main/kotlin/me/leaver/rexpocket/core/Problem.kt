@@ -23,6 +23,21 @@ enum class Trouble {
     /** The app's own Tailscale node could not start. */
     Tailnet,
 
+    /**
+     * The phone's tailnet node needs a sign-in before it reaches anything; [Problem.detail] is
+     * [APPROVAL] when it is signed in and waits for the tailnet's admin instead.
+     */
+    TailnetNeedsLogin,
+
+    /** The tailnet has no device by the host's name. */
+    TailnetPeerUnknown,
+
+    /** The host's device is offline on the tailnet; [Problem.detail] is when it was last seen, in epoch ms. */
+    TailnetPeerOffline,
+
+    /** The host answered over the tailnet, but nothing listens on Rex's port; [Problem.detail] is the port. */
+    RexNotListening,
+
     /** The machine's SSH key has not been confirmed yet; [Problem.detail] is its fingerprint. */
     SshHostKeyUnknown,
 
@@ -35,19 +50,29 @@ enum class Trouble {
     /** SSH reached the machine, but Rex is not installed or cannot run there. */
     SshCommand,
 
+    /** The phone's keystore could not open the host's saved SSH password or key; nothing was dialed. */
+    SshSecretUnreadable,
+
     Other,
 }
 
 data class Problem(val trouble: Trouble, val detail: String?)
 
-/** An action failed while the connection itself is fine. [id] tells two equal failures apart. */
-data class Notice(val id: Long, val problem: Problem)
+/**
+ * An action failed while the connection itself is fine. [id] tells two equal failures apart.
+ * [blockId] is the pane the failure belongs to, when it belongs to one: such a notice lasts only
+ * while that pane is the one on screen, and goes once the pane closes, is left, or recovers.
+ */
+data class Notice(val id: Long, val problem: Problem, val blockId: String? = null)
 
 /** Rex took the request, or the connection, and did not answer in time. Not a cancellation. */
 class RexTimeoutException(message: String) : Exception(message)
 
 /** The control connection closed after it was up. */
 class ConnectionDroppedException(message: String, cause: Throwable?) : Exception(message, cause)
+
+/** The pane being watched is gone from its session: closed, not failed, so its stream stops. */
+class PaneClosedException(message: String) : Exception(message)
 
 /** An action that needs a connection, a session or a pane before there is one. */
 class NotReadyException(message: String) : IllegalStateException(message)
@@ -66,8 +91,12 @@ fun Throwable.explainedBy(transport: Throwable?): Throwable {
 }
 
 /** Classifies by exception type along the cause chain; the message is kept as detail. */
+/** A failure that already knows what it is, such as a tailnet route that could not be set up. */
+class ProblemException(val problem: Problem) : Exception(problem.detail ?: problem.trouble.name)
+
 fun Throwable.toProblem(): Problem {
     val chain = generateSequence(this) { it.cause }.toList()
+    chain.firstOrNull { it is ProblemException }?.let { return (it as ProblemException).problem }
     chain.firstOrNull { it is SshHostKeyException }?.let { error ->
         val ssh = error as SshHostKeyException
         return Problem(

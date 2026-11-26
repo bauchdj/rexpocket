@@ -1,0 +1,157 @@
+name: android-apk
+
+# Builds the APKs for testing on a phone, all signed with the kept debug key:
+#   rexpocket.apk                 the app, Tailscale built in, and Netbird through the add-on
+#   rexpocket-netbird-addon.apk   the Netbird add-on, a separate app (me.leaver.rexpocket.netbird)
+#   rexpocket-netbird.apk         the app with Netbird embedded; it replaces rexpocket.apk
+#   rexpocket-debug.apk           rexpocket.apk as a debug build, for a debugger or Layout Inspector
+# rexpocket.apk and rexpocket-netbird.apk are the `optimized` build type: the release build (R8,
+# shrunk resources, baseline profile, not debuggable) signed with that key, so each installs over
+# the last, and over an earlier debug build, as an update. See docs/design/r8.md.
+# Download them from the run's rexpocket-apks artifact; R8's mapping.txt for each optimized APK is in
+# rexpocket-mapping, for retracing a stack trace from Diagnostics.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ccr-30ee0e05-w78lcg]
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Install the Android NDK and platform
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.1.0" "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      # One debug key for every run, so each APK installs over the last as an update. Gradle signs
+      # debug builds with ~/.android/debug.keystore; the first run makes it, later runs restore it.
+      # A key for the phone builds only: anyone with it could sign a build this one accepts as an update.
+      - name: Restore the debug signing key
+        id: debug-key
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rexpocket-debug-keystore-v1
+
+      - name: Make the debug signing key
+        if: steps.debug-key.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Keep the debug signing key
+        if: steps.debug-key.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rexpocket-debug-keystore-v1
+
+      - name: Signing key fingerprint
+        run: keytool -list -v -keystore ~/.android/debug.keystore -storepass android | grep -m1 "SHA256:"
+
+      - name: Build the default APK, optimized and debug
+        run: ./gradlew --no-daemon -Prexpocket.debugKeystore="$HOME/.android/debug.keystore" :app:assembleOptimized :app:assembleDebug
+
+      - name: Keep the default APKs aside
+        run: |
+          mkdir -p out mapping
+          cp app/build/outputs/apk/optimized/app-optimized.apk out/rexpocket.apk
+          cp app/build/outputs/apk/debug/app-debug.apk out/rexpocket-debug.apk
+          cp app/build/outputs/mapping/optimized/mapping.txt mapping/rexpocket-mapping.txt
+          # What is found by name kept its name (docs/design/r8.md); the device tests check it runs.
+          SEEDS=app/build/outputs/mapping/optimized/seeds.txt
+          grep -qxF 'me.leaver.rexpocket.terminal.GhosttyVt: int[] decodePng(byte[])' "$SEEDS"
+          grep -qxF 'me.leaver.rexpocket.core.Ed25519Signature: Ed25519Signature()' "$SEEDS"
+          grep -qxF 'me.leaver.rexpocket.core.Ed25519KeyPairGen: Ed25519KeyPairGen()' "$SEEDS"
+
+      - name: Build the Netbird add-on's library
+        run: REXPOCKET_NETBIRD=addon sh tools/build-tailnet.sh
+
+      - name: Build the Netbird add-on
+        run: |
+          ./gradlew --no-daemon -Prexpocket.debugKeystore="$HOME/.android/debug.keystore" :netbirdaddon:assembleDebug
+          cp netbirdaddon/build/outputs/apk/debug/netbirdaddon-debug.apk out/rexpocket-netbird-addon.apk
+
+      - name: Build the Netbird library
+        run: REXPOCKET_NETBIRD=1 sh tools/build-tailnet.sh
+
+      - name: Build the optimized APK with Netbird
+        run: ./gradlew --no-daemon -Prexpocket.debugKeystore="$HOME/.android/debug.keystore" -Prexpocket.netbird=true :app:assembleOptimized
+
+      - name: Keep the Netbird APK aside
+        run: |
+          cp app/build/outputs/apk/optimized/app-optimized.apk out/rexpocket-netbird.apk
+          cp app/build/outputs/mapping/optimized/mapping.txt mapping/rexpocket-netbird-mapping.txt
+
+      - name: Check the APKs carry the kept key, and which one offers the add-on
+        run: |
+          WANT=$(keytool -list -v -keystore ~/.android/debug.keystore -storepass android | grep -m1 "SHA256:" | awk '{print $2}' | tr -d ':' | tr 'A-F' 'a-f')
+          for apk in out/rexpocket.apk out/rexpocket-debug.apk out/rexpocket-netbird-addon.apk out/rexpocket-netbird.apk; do
+            GOT=$("$ANDROID_HOME/build-tools/36.1.0/apksigner" verify --print-certs "$apk" | grep -m1 "SHA-256 digest" | awk '{print $NF}')
+            echo "$apk $GOT"
+            [ "$GOT" = "$WANT" ] || { echo "signed with another key than the kept one"; exit 1; }
+          done
+          AAPT2="$ANDROID_HOME/build-tools/36.1.0/aapt2"
+          # The default app asks for the add-on's permission; the embedded one has nothing of the add-on.
+          "$AAPT2" dump xmltree --file AndroidManifest.xml out/rexpocket.apk | grep -q 'me.leaver.rexpocket.netbird.permission.NODE'
+          if "$AAPT2" dump xmltree --file AndroidManifest.xml out/rexpocket-netbird.apk | grep -q 'me.leaver.rexpocket.netbird'; then
+            echo "rexpocket-netbird.apk offers the add-on"; exit 1
+          fi
+          [ "$("$AAPT2" dump packagename out/rexpocket-netbird-addon.apk)" = me.leaver.rexpocket.netbird ]
+          # The optimized APKs are not debuggable and carry the baseline profile; the debug one is
+          # debuggable. All of the app's are the same package and version, so each installs over the others.
+          for apk in out/rexpocket.apk out/rexpocket-netbird.apk; do
+            badging=$("$AAPT2" dump badging "$apk")
+            if grep -q application-debuggable <<< "$badging"; then echo "$apk is debuggable"; exit 1; fi
+            unzip -l "$apk" > listing.txt
+            grep -q 'assets/dexopt/baseline.prof$' listing.txt || { echo "$apk has no baseline profile"; exit 1; }
+          done
+          badging=$("$AAPT2" dump badging out/rexpocket-debug.apk)
+          grep -q application-debuggable <<< "$badging" || { echo "rexpocket-debug.apk is not debuggable"; exit 1; }
+          versions=$(for apk in out/rexpocket.apk out/rexpocket-debug.apk out/rexpocket-netbird.apk; do
+            "$AAPT2" dump badging "$apk" > badging.txt
+            head -1 badging.txt | awk '{ print $2, $3 }'
+          done | sort -u)
+          echo "$versions"
+          [ "$(printf '%s\n' "$versions" | wc -l)" = 1 ] || { echo "the app's APKs differ in package or version"; exit 1; }
+
+      - name: Sizes
+        run: |
+          for apk in out/*.apk; do
+            echo "$(basename "$apk"): $(stat -c %s "$apk") bytes"
+            unzip -l "$apk" | awk '$4 ~ /^(lib\/.*\.so|classes[0-9]*\.dex|resources\.arsc|assets\/dexopt\/baseline\.prof)$/ { print "  " $4 ": " $1 " bytes" }'
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rexpocket-apks
+          path: out/*.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rexpocket-mapping
+          path: mapping/*.txt
+          if-no-files-found: error

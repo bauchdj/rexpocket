@@ -1,10 +1,11 @@
 package me.leaver.rexpocket.core
 
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -29,6 +30,8 @@ class RexClient(
     private val apiRevision: Int = 7,
     /** Why the transport itself failed, when OkHttp reduced it to "exhausted all routes". */
     private val transportFailure: () -> Throwable? = { null },
+    /** What the hello says the client runs on: the phone says `other`; a test's desk may say `macos`. */
+    private val platform: String = "other",
 ) {
     private val ids = AtomicLong(0)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
@@ -37,10 +40,16 @@ class RexClient(
     private var socket: WebSocket? = null
 
     private val finished = CompletableDeferred<Throwable?>()
+    /**
+     * Rex's events, none dropped. The session takes them in order and some wait on a call (a tab
+     * opened at the desk reads the view again), so on a slow network a busy pane's progress and
+     * titles pile up behind one; a buffer that dropped the oldest lost an agent's approval request
+     * among them, and the phone showed it working until it reconnected. What piles up is bounded
+     * by the calls' time limits. The replay is for the collector that starts after the welcome.
+     */
     private val _events = MutableSharedFlow<JSONObject>(
         replay = 64,
-        extraBufferCapacity = 256,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        extraBufferCapacity = Int.MAX_VALUE - 64,
     )
     val events: SharedFlow<JSONObject> = _events
 
@@ -78,7 +87,12 @@ class RexClient(
         pending[id] = waiter
         val msg = JSONObject().put("type", "request").put("id", id).put("method", method)
         if (payload != null) msg.put("payload", payload)
-        if (!ws.send(msg.toString())) {
+        val text = msg.toString()
+        if (tooLarge(text)) {
+            pending.remove(id)
+            throw RexCallException("too_large", 413, "$method is larger than Rex takes in one message")
+        }
+        if (!ws.send(text)) {
             pending.remove(id)
             // A connection that went away under a call is a drop, which the app says in its own
             // words; a socket that never opened is the failure that kept it from opening.
@@ -113,12 +127,33 @@ class RexClient(
         val id = ids.incrementAndGet().toString()
         val msg = JSONObject().put("type", "request").put("id", id).put("method", method)
         if (payload != null) msg.put("payload", payload)
-        return ws.send(msg.toString())
+        val text = msg.toString()
+        return !tooLarge(text) && ws.send(text)
     }
 
-    fun close() {
+    /**
+     * Whether [text] is over the welcome's `max_message_bytes`. Rex ends the whole connection on
+     * such a request (1009, "read limited"), so only that request fails, as its guide asks.
+     */
+    private fun tooLarge(text: String): Boolean {
+        val limit = welcome?.maxMessageBytes?.takeIf { it > 0 } ?: MIN_MESSAGE_BYTES
+        // A UTF-8 character is at most 3 bytes per UTF-16 unit: most messages need no count.
+        return text.length.toLong() * 3 > limit && text.toByteArray(Charsets.UTF_8).size > limit
+    }
+
+    fun close() = end(frame = true)
+
+    /**
+     * Ends the connection without a close frame, as a network that went away does. Rex then keeps
+     * the client for a minute - its id, its sessions, its panes (handed back when it resumes) and its
+     * streams - for a hello with the reconnect token; a close frame ends the client at once and
+     * closes its streams with 1001 (seen on Rex 0.1.0-preview.22, and its reference says so).
+     */
+    fun drop() = end(frame = false)
+
+    private fun end(frame: Boolean) {
         if (!closed.compareAndSet(false, true)) return
-        socket?.close(1000, "bye")
+        if (frame) socket?.close(1000, "bye") else socket?.cancel()
         failPending(ConnectionDroppedException("Connection closed", null))
         if (!opened.isCompleted) opened.completeExceptionally(IllegalStateException("Connection closed"))
         finish(null)
@@ -134,7 +169,7 @@ class RexClient(
                     "client",
                     JSONObject()
                         .put("kind", "app")
-                        .put("platform", "other")
+                        .put("platform", platform)
                         .put("name", "RexPocket")
                         .put("version", "0.1.0"),
                 )
@@ -156,7 +191,7 @@ class RexClient(
                         reconnectToken = client?.optNullableString("reconnect_token"),
                         resumed = client?.optBoolean("resumed") ?: false,
                         apiRevision = obj.optInt("api_revision"),
-                        maxMessageBytes = obj.optJSONObject("limits")?.optInt("max_message_bytes") ?: 65536,
+                        maxMessageBytes = obj.optJSONObject("limits")?.optInt("max_message_bytes")?.takeIf { it > 0 } ?: MIN_MESSAGE_BYTES,
                     )
                     welcome = w
                     if (!opened.isCompleted) opened.complete(w)
@@ -200,22 +235,50 @@ class RexClient(
     }
 
     private fun failPending(err: Throwable) {
-        val left = pending.values.toList()
+        // A copy by toArray: toList sizes the list first and then iterates, and a call ending on
+        // another thread in between threw NoSuchElementException on the socket's thread.
+        val left = ArrayList(pending.values)
         pending.clear()
         left.forEach { if (!it.isCompleted) it.completeExceptionally(err) }
     }
 
     companion object {
+        /** The WebSocket ping, on Rex's own schedule. */
+        const val PING_INTERVAL_S = 120L
+
+        /**
+         * What every connection attempt's client shares: one dispatcher, so a host retried all
+         * night reuses its threads instead of leaving each attempt's idle for a minute. Its limits
+         * are lifted: each pane's stream is a WebSocket that holds a dispatcher thread while it is
+         * open, and one host's streams must never wait behind each other.
+         */
+        private val base: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .dispatcher(Dispatcher().apply { maxRequests = Int.MAX_VALUE; maxRequestsPerHost = Int.MAX_VALUE })
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                // Rex pings every 120 s and asks clients to do the same (rex-protocol, "Staying Connected").
+                // A 30 s ping kept a tailnet path's 3 s heartbeat running all night; on screen the
+                // session's own check finds a dead connection sooner.
+                .pingInterval(PING_INTERVAL_S, TimeUnit.SECONDS)
+                .build()
+        }
+
         /**
          * [socksPort] is the loopback port of the app's own Tailscale inbound. OkHttp hands a SOCKS5
          * proxy the hostname unresolved, so a tailnet name is resolved by Tailscale itself.
+         *
+         * Each call is an attempt's own client on the shared [base], with a pool of its own: an
+         * idle connection left by an earlier attempt, perhaps dead with the network it was on, is
+         * never what a new attempt dials on.
          */
-        fun defaultHttp(socksPort: Int = 0): OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)
+        fun defaultHttp(socksPort: Int = 0, dialer: StreamDialer? = null): OkHttpClient = base.newBuilder()
+            .connectionPool(ConnectionPool())
             .apply {
-                if (socksPort > 0) {
+                if (dialer != null) {
+                    // A node in another app (the Netbird add-on) dials for the app: the name goes to it unresolved.
+                    proxy(Proxy.NO_PROXY).socketFactory(DialedSocketFactory(dialer)).dns(UnresolvedDns)
+                } else if (socksPort > 0) {
                     proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", socksPort)))
                 }
             }

@@ -1,7 +1,9 @@
 package me.leaver.rexpocket.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RexModelsTest {
@@ -149,6 +151,31 @@ class RexModelsTest {
         assertNull(summarizeStatus(emptyList()))
     }
 
+    /**
+     * Rex's Activity order is blocked, failed, done, working, idle. Rex keeps a pane's records side
+     * by side and sums nothing up (seen on 0.1.0-preview.22: a root `working` and a child `done` are
+     * both listed by `program_status`), so a pane with a finished child shows as done, as Activity
+     * would place it - not as running.
+     */
+    @Test
+    fun aPaneSumsUpInRexsActivityOrder() {
+        assertEquals("done", summarizeStatus(listOf(record("working"), record("done")))?.state)
+        assertEquals("error", summarizeStatus(listOf(record("done"), record("error"), record("working")))?.state)
+        assertEquals("working", summarizeStatus(listOf(record("idle"), record("working")))?.state)
+        // A state Rex's reference does not name counts as idle, below working.
+        assertEquals("working", summarizeStatus(listOf(record("thinking"), record("working")))?.state)
+    }
+
+    /** A record carries the time Rex received it, which the activity view's ages come from. */
+    @Test
+    fun aRecordKeepsTheTimeRexReceivedIt() {
+        val event = org.json.JSONObject(
+            """{"id":"","record":{"state":"done","msg":"all good","updated_at":"2026-11-22T17:07:55.820482663Z"},"reason":"report"}""",
+        )
+        val record = applyStatusEvent(emptyMap(), event).getValue("")
+        assertEquals(java.time.Instant.parse("2026-11-22T17:07:55.820Z").toEpochMilli(), record.updatedAt)
+    }
+
     @Test
     fun countsPanesAcrossTabs() {
         val view = view(active = "w1", window("w1", focused = "a", "a", "b"), window("w2", focused = "c", "c"))
@@ -182,6 +209,18 @@ class RexModelsTest {
         zoomedBlockId = null,
         blocks = blocks.map { BlockInfo(it, it, null, null, null) },
     )
+
+    @Test
+    fun aSpinnerFrameIsTheSameTitleAndAnythingElseIsNot() {
+        assertTrue(sameTitleButSpinner("π ⠋ ROTATE: preview", "π ⠙ ROTATE: preview"))
+        assertTrue(sameTitleButSpinner("⠐ Claude Code", "⠂ Claude Code"))
+        assertFalse(sameTitleButSpinner("π ⠋ ROTATE: preview", "π ⠋ ROTATE: the preview"))
+        // The spinner stopping, or starting, is news.
+        assertFalse(sameTitleButSpinner("π ⠋ ROTATE: preview", "π ROTATE: preview"))
+        assertFalse(sameTitleButSpinner("π ROTATE: preview", "π ⠋ ROTATE: preview"))
+        assertFalse(sameTitleButSpinner(null, "⠋ pi"))
+        assertFalse(sameTitleButSpinner("vim", "vim"))
+    }
 
     private fun record(state: String) = ProgramRecord("r", state, null, null, null, null, null)
 }

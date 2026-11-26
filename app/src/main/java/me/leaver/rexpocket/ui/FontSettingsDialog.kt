@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
@@ -33,6 +32,9 @@ internal fun FontSettingsDialog(
     state: TerminalFontState,
     typeface: Typeface,
     onSelect: (String) -> Unit,
+    /** The text size new tabs start at, with − / + and Reset: the font's size beside its face. */
+    fontScale: Float = me.leaver.rexpocket.core.TextScale.DEFAULT,
+    onFontScale: (Float) -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     val enabled = !state.initializing && state.downloading == null
@@ -47,6 +49,7 @@ internal fun FontSettingsDialog(
                     "Aa 0O 1l {} [] →\n\uE0B0 \uF07B \uE718 \uDB80\uDE4B",
                     fontFamily = FontFamily(typeface),
                 )
+                DefaultTextSize(fontScale, onFontScale, Modifier.padding(top = 8.dp))
                 FontOption(
                     stringResource(R.string.terminal_font_system),
                     stringResource(R.string.terminal_font_system_detail),

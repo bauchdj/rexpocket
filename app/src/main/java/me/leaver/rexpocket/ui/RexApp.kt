@@ -20,6 +20,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -29,44 +34,100 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import me.leaver.rexpocket.R
+import me.leaver.rexpocket.core.LoginLinkGate
+import me.leaver.rexpocket.core.Phase
 import me.leaver.rexpocket.core.Trouble
+import me.leaver.rexpocket.data.HomeMarks
 import me.leaver.rexpocket.data.SavedHost
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import me.leaver.rexpocket.update.InstallResult
 import me.leaver.rexpocket.update.UpdateState
+import me.leaver.rexpocket.ui.guide.Guide
+import me.leaver.rexpocket.ui.guide.GuideHost
+import me.leaver.rexpocket.ui.guide.GuideLayer
+import me.leaver.rexpocket.ui.guide.LocalGuide
+import androidx.compose.runtime.CompositionLocalProvider
 
 // The app root: lays the list and the pane out for the window in hand, and hosts the dialogs that
 // float over both.
 
 @Composable
-fun RexPocketApp(model: RexViewModel = viewModel()) {
+fun RexPocketApp(
+    model: RexViewModel = viewModel(),
+    /** Opens a link in the browser; a test hands its own in, to see which links opened. */
+    openUrl: ((String) -> Unit)? = null,
+) = RexPocketApp(model, openUrl, remember { Guide() })
+
+@Composable
+internal fun RexPocketApp(
+    model: RexViewModel,
+    openUrl: ((String) -> Unit)? = null,
+    /** Help's state; a test hands its own in, to drive Show me and see what the spotlight found. */
+    guide: Guide,
+) {
     val route by model.route.collectAsState()
     val hosts by model.hosts.collectAsState()
     val pocket by model.pocket.collectAsState()
     val font by model.fontScale.collectAsState()
+    val launchTemplates by model.launchTemplates.collectAsState()
+    val pinchHint by model.pinchHint.collectAsState()
     val terminalTypeface by model.terminalTypeface.collectAsState()
     val terminalFont by model.terminalFont.collectAsState()
     var fontSettingsOpen by remember { mutableStateOf(false) }
-    val tailscale by model.tailscale.collectAsState()
-    val tailscaleStatus by model.tailscaleStatus.collectAsState()
+    val tailnet by model.tailnet.collectAsState()
+    val tailnetStatus by model.tailnetStatus.collectAsState()
     val tailnetError by model.tailnetError.collectAsState()
     val opening by model.opening.collectAsState()
     val tailnetPath by model.tailnetPath.collectAsState()
+    val tailnetStage by model.tailnetStage.collectAsState()
+    val tailnetView by model.tailnetView.collectAsState()
+    val homeRequest by model.homeRequest.collectAsState()
+    val connectProgress by model.connectProgress.collectAsState()
+    val lives by model.lives.collectAsState()
+    val sshKeyQuestion by model.sshKeyQuestion.collectAsState()
     val alerts by model.alerts.collectAsState()
-    val keyBarShift by model.keyBarShift.collectAsState()
-    val keyBarAlt by model.keyBarAlt.collectAsState()
+    val alertPrefs by model.alertPrefs.collectAsState()
+    val background by model.background.collectAsState()
+    val keyArrangement by model.keyArrangement.collectAsState()
+    val quickReplies by model.quickReplies.collectAsState()
+    val keyBarCtrlC by model.keyBarCtrlC.collectAsState()
+    val gestures by model.gestures.collectAsState()
     val keyBar by model.keyBar.collectAsState()
     val upload by model.upload.collectAsState()
     val update by model.update.collectAsState()
     val updateChannel by model.updateChannel.collectAsState()
+    val folds by model.folds.collectAsState()
+    val homeFilter by model.homeFilter.collectAsState()
+    val activityPrefs by model.activityPrefs.collectAsState()
+    val seenMarks by model.seenMarks.collectAsState()
+    val reopenLastTab by model.reopenLastTab.collectAsState()
+    val appearance by model.appearance.collectAsState()
+    val share by model.share.collectAsState()
+    val hostImport by model.hostImport.step.collectAsState()
+    val backup by model.settingsBackup.step.collectAsState()
+    // Backup or Import hosts opened from Settings: their first page has a back arrow to it.
+    var dataFromSettings by rememberSaveable { mutableStateOf(false) }
+    var openingFromSettings by remember { mutableStateOf(false) }
+    fun fromSettings(): Boolean = openingFromSettings.also { openingFromSettings = false }
+    // Closed by a swipe or Back rather than the arrow, neither is from Settings any more: a backup
+    // or host list opened from Files next has no arrow to Settings.
+    val dataOpen = backup != null || hostImport != null
+    LaunchedEffect(dataOpen) { if (!dataOpen) dataFromSettings = false }
+    val security by model.security.collectAsState()
     val context = LocalContext.current
-    var tailscaleOpen by remember { mutableStateOf(false) }
+    // The home screen leaves the composition while a terminal fills the window; its saved state
+    // (the open sheet, search, eye, scroll) is kept here for when it comes back.
+    val saveable = rememberSaveableStateHolder()
+    var tailnetOpen by remember { mutableStateOf(false) }
+    // Leave tailnet's confirm: the hosts that go with it, and Forget the sign-in.
+    var tailnetLeaving by remember { mutableStateOf(false) }
     // Each offer is shown once per app run; the settings row still has it afterwards.
     var offeredOnce by remember { mutableStateOf(emptySet<String>()) }
+    // MainActivity has already started the connections as it was created; this is for an app
+    // composed without it (the screen tests), and does nothing a second time.
     LaunchedEffect(Unit) { model.restore() }
     // Once a day: look for a newer build and say so. Nothing is downloaded until it is asked for.
     LaunchedEffect(Unit) { model.checkForUpdates() }
@@ -90,48 +151,130 @@ fun RexPocketApp(model: RexViewModel = viewModel()) {
         model.setForeground(true)
         onStopOrDispose { model.setForeground(false) }
     }
-    // A node that still needs a login can only say so through the link it prints, so take the
-    // user straight to it instead of leaving a URL to copy.
-    val authUrl = tailscaleStatus.authUrl
-    LaunchedEffect(authUrl) {
-        if (authUrl.isBlank()) return@LaunchedEffect
-        openLink(context, authUrl)
+    val open: (String) -> Unit = openUrl ?: { url -> openLink(context, url) }
+    // The login link opens by itself only right after a Join or a Sign in that came before the
+    // link did; otherwise the Sign in card on Home shows it and waits for the tap.
+    val loginGate = remember { LoginLinkGate() }
+    LaunchedEffect(tailnetStage) {
+        loginGate.linkToOpen(tailnetStage)?.let(open)
     }
-    RexTheme {
-        Box(Modifier.fillMaxSize().background(Colors.bg)) {
-            val window = windowSize()
+    val signIn: (String) -> Unit = { url ->
+        if (url.isNotBlank()) {
+            loginGate.cancel()
+            open(url)
+        } else {
+            loginGate.asked(tailnetStage)
+        }
+    }
+    // Help: its sheet, Show me and the tour, over both screens (ui/guide, docs/design/help-guide.md).
+    CompositionLocalProvider(LocalGuide provides guide) { RexTheme(appearance.app, appearance.terminal, appearance.text) {
+        val window = windowSize()
+        val layout = layoutFor(window, hasHosts = hosts.isNotEmpty(), terminalOpen = route == Route.Term)
+        GuideLayer(Modifier.fillMaxSize()) { Box(
+            Modifier
+                .fillMaxSize()
+                .background(Colors.bg)
+                // Any touch or key is the person taking over: a launch resume still on its way
+                // gives way to it. Watched on the way down, never consumed.
+                .pointerInput(model) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            awaitPointerEvent(PointerEventPass.Initial)
+                            model.userActed()
+                        }
+                    }
+                }
+                .onPreviewKeyEvent {
+                    model.userActed()
+                    false
+                },
+        ) {
             // A tablet or a desk window keeps the list beside the pane: a session or a tab is
             // switched without leaving the terminal it was showing. With nothing open, the pane
             // side says so and waits for a pick.
-            val home: @Composable (Boolean) -> Unit = { detail ->
+            val home: @Composable (Boolean) -> Unit = { detail -> saveable.SaveableStateProvider("home") {
                 HomeScreen(
                     detail = detail,
                     hosts = hosts,
                     connected = model.host,
-                    state = pocket,
-                    tailscale = tailscale,
-                    tailscaleStatus = tailscaleStatus,
+                    lives = lives,
+                    tailnet = tailnet,
+                    tailnetStatus = tailnetStatus,
                     tailnetError = tailnetError,
                     tailnetPath = tailnetPath,
+                    tailnetStage = tailnetStage,
+                    onSignIn = signIn,
+                    onTailnetRetry = model::restartTailnet,
+                    onTailnetRestart = model::restartTailnetNode,
+                    tailnetView = tailnetView,
+                    onTailnetConnect = model::connectTailnet,
+                    onTailnetDisconnect = model::disconnectTailnet,
+                    onTailnetPolicy = model::setTailnetPolicy,
+                    tailnetAccounts = remember(model) {
+                        TailnetAccountOps(
+                            switch = model::switchTailnetAccount,
+                            add = model::addTailnetAccount,
+                            rename = model::renameTailnetAccount,
+                            remove = model::removeTailnetAccount,
+                            hostsNaming = model::hostsOnAccount,
+                        )
+                    },
+                    request = homeRequest,
+                    onRequestHandled = { model.homeRequest.value = null },
                     opening = opening,
                     cachedSessions = model::cachedSessions,
+                    folds = folds,
+                    onHostOpen = model::setHostOpen,
+                    onFoldSessions = model::setSessionsFolded,
+                    onSetFolds = model::setFolds,
+                    filter = homeFilter,
+                    onHomeFilter = model::setHomeFilter,
+                    activityPrefs = activityPrefs,
+                    onActivityPrefs = model::setActivityPrefs,
+                    seenMarks = seenMarks,
+                    onMarkSeen = { hostId, blocks -> model.markSeen(hostId, blocks) },
+                    onRestoreSeen = model::restoreSeen,
+                    onReply = model::reply,
+                    onInterrupt = model::interrupt,
+                    onAnswer = model::answerPrompt,
+                    onSendPrompt = model::sendPrompt,
+                    quickReplies = quickReplies,
+                    onQuickReplies = model::setQuickReplies,
+                    drafts = model.drafts,
+                    onMoveHost = model::moveHost,
+                    onRemoveHost = model::removeHost,
+                    onRestoreHost = model::restoreHost,
+                    launchTemplates = launchTemplates,
+                    onLaunchTemplates = model::setLaunchTemplates,
+                    onRunTemplate = model::runTemplate,
+                    notices = model.homeNotices,
+                    onNoticeAction = model::noticeAction,
+                    onFoldSession = model::setSessionFolded,
                     onConnect = { model.connect(it) },
                     onOpenSession = model::openSessionOn,
                     onOpenTab = model::openTabOn,
+                    onOpenPane = model::openPaneOn,
                     onNewSession = model::createSessionOn,
                     onNewTab = model::newTabOn,
-                    onDisconnect = model::disconnect,
-                    onRetry = model::retryNow,
-                    onProbePath = model::probeTailnetPath,
+                    onManage = { hostId, action -> model.manage(action, hostId) },
+                    onDisconnect = { model.disconnect(it) },
+                    onRetry = { model.retryNow(it) },
+                    onProbePath = { model.probeTailnetPath(it) },
                     onSave = model::saveHost,
                     onDelete = model::deleteHost,
-                    onTailscale = { tailscaleOpen = true },
+                    onTailnet = { tailnetOpen = true },
                     alerts = alerts,
                     onAlerts = model::setAlerts,
-                    keyBarShift = keyBarShift,
-                    keyBarAlt = keyBarAlt,
-                    onKeyBarShift = model::setKeyBarShift,
-                    onKeyBarAlt = model::setKeyBarAlt,
+                    alertPrefs = alertPrefs,
+                    onAlertPrefs = model::setAlertPrefs,
+                    background = background,
+                    onHostBackground = model::setHostBackground,
+                    keyArrangement = keyArrangement,
+                    onKeyArrangement = model::setKeyArrangement,
+                    keyBarCtrlC = keyBarCtrlC,
+                    onKeyBarCtrlC = model::setKeyBarCtrlC,
+                    gestures = gestures,
+                    onGestures = model::setGestures,
                     keyBar = keyBar,
                     onKeyBar = model::setKeyBar,
                     onFontSettings = { fontSettingsOpen = true },
@@ -140,22 +283,43 @@ fun RexPocketApp(model: RexViewModel = viewModel()) {
                     onUpdate = { updateTapped(update) },
                     updateChannel = updateChannel,
                     onUpdateChannel = model::setUpdateChannel,
+                    reopenLastTab = reopenLastTab,
+                    onReopenLastTab = model::setReopenLastTab,
+                    appearance = appearance,
+                    onAppearance = model::setAppearance,
+                    terminalTextSize = font,
+                    onTerminalTextSize = model::setFont,
+                    onImportHosts = {
+                        dataFromSettings = fromSettings()
+                        model.hostImport.open()
+                    },
+                    onBackup = {
+                        dataFromSettings = fromSettings()
+                        model.settingsBackup.open()
+                    },
+                    onFromSettings = { openingFromSettings = true },
+                    hostTester = model.hostTester,
+                    openSecrets = model::hostWithSecrets,
+                    security = security,
+                    onSecurity = model::setSecurity,
                 )
-            }
+            } }
             val term: @Composable (Boolean) -> Unit = { embedded ->
                 TermScreen(
                     embedded = embedded,
                     keyBarWithKeyboard = keyBar,
-                    keyBarShift = keyBarShift,
-                    keyBarAlt = keyBarAlt,
+                    keyArrangement = keyArrangement,
+                    keyBarCtrlC = keyBarCtrlC,
+                    gestures = gestures,
                     state = pocket,
                     fontScale = font,
                     terminalTypeface = terminalTypeface,
-                    onFont = model::setFont,
                     onBack = model::showHome,
                     onOpenSession = model::openSession,
+                    onOpenTab = model::openTab,
                     watchPane = model::watchPane,
-                    onRetry = model::retryNow,
+                    paneCopies = model::paneCopies,
+                    onRetry = { model.retryNow() },
                     onDismissNotice = model::dismissNotice,
                     onAct = model::act,
                     upload = upload,
@@ -163,9 +327,24 @@ fun RexPocketApp(model: RexViewModel = viewModel()) {
                     onCancelUpload = model::cancelUpload,
                     onDismissUpload = model::dismissUpload,
                     onRetryUpload = model::retryUpload,
+                    quickReplies = quickReplies.items,
+                    drafts = model.drafts,
+                    draftHost = model.host?.id,
+                    seenMark = { block -> model.host?.id?.let { seenMarks[HomeMarks.key(it, block)] } },
+                    textSizes = model.textSizes,
+                    pinchHint = pinchHint,
+                    onPinchHintSeen = model::pinchHintSeen,
+                    onQuickReplies = model::setQuickReplies,
+                    tabMuted = { window -> model.host?.id?.let { background.of(it).mutes(window) } == true },
+                    onMuteTab = { window, muted -> model.host?.id?.let { model.muteTab(it, window, muted) } },
+                    rexActions = model.rexActions.collectAsState().value,
+                    onPaletteOpen = model::loadRexActions,
+                    onRexAction = model::runRexAction,
+                    templates = model.host?.id?.let { launchTemplates[it] }.orEmpty(),
+                    onTemplates = { next -> model.host?.id?.let { model.setLaunchTemplates(it, next) } },
                 )
             }
-            when (layoutFor(window, hasHosts = hosts.isNotEmpty(), terminalOpen = route == Route.Term)) {
+            when (layout) {
                 WindowLayout.ListDetail -> BoxWithConstraints(Modifier.fillMaxSize()) {
                     val list = listPaneWidth(maxWidth)
                     val open = route == Route.Term
@@ -183,6 +362,12 @@ fun RexPocketApp(model: RexViewModel = viewModel()) {
                 }
                 WindowLayout.OneColumn -> if (route == Route.Term) term(false) else home(false)
             }
+        } }
+        GuideHost(guide, model, homeShown = layout != WindowLayout.OneColumn || route != Route.Term)
+        // A question one of the person's Rex actions asks, over whatever is on screen.
+        model.rexPrompt.collectAsState().value?.let { prompt ->
+            val actions = model.rexActions.collectAsState().value
+            RexPromptDialog(prompt, actions.firstOrNull { it.name == prompt.action }?.title ?: prompt.action, model::answerRexPrompt)
         }
         val offered = update
         val offeredTag = when (offered) {
@@ -196,45 +381,97 @@ fun RexPocketApp(model: RexViewModel = viewModel()) {
                 tag = offeredTag,
                 downloaded = offered is UpdateState.Ready,
                 onConfirm = {
+                    model.userActed()
                     offeredOnce = offeredOnce + offerKey
                     updateTapped(offered)
                 },
-                onLater = { offeredOnce = offeredOnce + offerKey },
+                onLater = {
+                    model.userActed()
+                    offeredOnce = offeredOnce + offerKey
+                },
+            )
+        }
+        share?.let { offer ->
+            ShareSheet(
+                offer = offer,
+                hosts = hosts,
+                connected = model.host,
+                state = pocket,
+                progress = connectProgress,
+                stage = tailnetStage,
+                network = tailnetName(tailnet.backend),
+                onSend = model::sendShare,
+                onChoose = model::chooseShareTarget,
+                onPick = model::shareTo,
+                onConnect = model::shareConnect,
+                onCancel = model::cancelShare,
+            )
+        }
+        fun backToSettings(close: () -> Unit): (() -> Unit)? = if (!dataFromSettings) null else ({
+            close()
+            dataFromSettings = false
+            model.showSettings()
+        })
+        backup?.let { step ->
+            SettingsBackupSheet(
+                step = step,
+                backupper = model.settingsBackup,
+                onBack = backToSettings { model.settingsBackup.close() },
+            )
+        }
+        hostImport?.let { step ->
+            HostImportSheet(
+                step = step,
+                connected = hosts.filter { lives[it.id]?.state?.phase == Phase.Live },
+                importer = model.hostImport,
+                onBackup = {
+                    model.hostImport.close()
+                    dataFromSettings = false
+                    model.settingsBackup.open()
+                },
+                onBack = backToSettings { model.hostImport.close() },
             )
         }
         if (fontSettingsOpen) {
-            FontSettingsDialog(terminalFont, terminalTypeface, model::selectTerminalFont) { fontSettingsOpen = false }
+            FontSettingsDialog(terminalFont, terminalTypeface, model::selectTerminalFont, fontScale = font, onFontScale = model::setFont) { fontSettingsOpen = false }
         }
-        if (tailscaleOpen) {
-            TailscaleDialog(
-                initial = tailscale,
-                status = tailscaleStatus,
+        if (tailnetOpen) {
+            TailnetDialog(
+                initial = tailnet,
+                backends = model.tailnetBackends,
+                status = tailnetStatus,
                 error = tailnetError,
-                onDismiss = { tailscaleOpen = false },
-                onJoin = { name ->
-                    model.joinTailnet(name)
-                    tailscaleOpen = false
+                onDismiss = { tailnetOpen = false },
+                onJoin = { backend, name, managementUrl, setupKey ->
+                    loginGate.asked(tailnetStage)
+                    model.joinTailnet(backend, name, managementUrl, setupKey)
+                    tailnetOpen = false
                 },
                 onLeave = {
-                    model.leaveTailnet()
-                    tailscaleOpen = false
+                    tailnetOpen = false
+                    tailnetLeaving = true
                 },
             )
         }
-        val sshHost = model.host
-        val sshProblem = pocket.problem
-        if (sshHost != null && sshHost.viaSsh && sshProblem != null &&
-            (sshProblem.trouble == Trouble.SshHostKeyUnknown || sshProblem.trouble == Trouble.SshHostKeyChanged)
-        ) {
+        if (tailnetLeaving) {
+            LeaveTailnetDialog(tailnetView, onDismiss = { tailnetLeaving = false }) { forget ->
+                tailnetLeaving = false
+                loginGate.cancel()
+                model.leaveTailnet(forget)
+            }
+        }
+        // Any connected SSH host can ask, not only the one on screen: it is waiting for the answer.
+        sshKeyQuestion?.let { asking ->
+            val sshProblem = asking.state.problem ?: return@let
             SshHostKeyDialog(
-                host = sshHost,
+                host = asking.target,
                 changed = sshProblem.trouble == Trouble.SshHostKeyChanged,
                 fingerprint = sshProblem.detail.orEmpty(),
-                onTrust = { fingerprint -> model.trustSshHostKey(fingerprint) },
-                onCancel = { model.disconnect() },
+                onTrust = { fingerprint -> model.trustSshHostKey(asking.target.id, fingerprint) },
+                onCancel = { model.disconnect(asking.target.id) },
             )
         }
-    }
+    } }
 }
 
 /**
